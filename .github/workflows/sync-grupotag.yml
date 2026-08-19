@@ -1,0 +1,44 @@
+name: Sync Grupos de Tags Tiny
+
+on:
+  # Dispara automaticamente assim que "Sync Tags Produtos Tiny" terminar.
+  workflow_run:
+    workflows: ["Sync Tags Produtos Tiny"]
+    types:
+      - completed
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    # Só roda se foi disparo manual, OU se "Sync Tags Produtos Tiny" terminou com sucesso
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main   # garante que pega o CSV de tags já atualizado
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar sincronização de grupos de tags
+        env:
+          TINY_TOKEN: ${{ secrets.TINY_TOKEN }}
+        run: python getObterGruposTag.py
+
+      - name: Salvar CSV atualizado no repositório
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add TB_bases/
+          git diff --staged --quiet || git commit -m "Atualiza grupos de tags [skip ci]"
+          git push

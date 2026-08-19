@@ -1,0 +1,36 @@
+name: Sync Estoque Tiny
+
+on:
+  schedule:
+    # De hora em hora, das 8h às 17h horário de Brasília (UTC-3) = 11h às 20h UTC
+    - cron: '0 11-20 * * *'
+  workflow_dispatch: {}   # permite rodar manualmente pela aba Actions
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar sincronização de estoque
+        env:
+          TINY_TOKEN: ${{ secrets.TINY_TOKEN }}
+        run: python getObterEstoque.py
+
+      - name: Salvar checkpoint e CSV atualizados no repositório
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add TB_bases/
+          git diff --staged --quiet || git commit -m "Atualiza estoque [skip ci]"
+          git push
