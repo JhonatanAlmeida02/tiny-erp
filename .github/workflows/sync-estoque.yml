@@ -32,5 +32,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add TB_bases/
-          git diff --staged --quiet || git commit -m "Atualiza estoque [skip ci]"
-          git push
+          if git diff --staged --quiet; then
+            echo "Nada novo para commitar."
+            exit 0
+          fi
+          git commit -m "Atualiza estoque [skip ci]"
+          # Se outro workflow (produtos, tags, etc.) deu push entre o checkout
+          # e agora, o push abaixo seria rejeitado. Por isso: puxa com rebase
+          # e tenta de novo, algumas vezes, antes de desistir.
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push; then
+              exit 0
+            fi
+            echo "Push falhou (tentativa $i/5), tentando de novo em instantes..."
+            sleep $((RANDOM % 15 + 5))
+          done
+          echo "Falha ao dar push depois de várias tentativas."
+          exit 1

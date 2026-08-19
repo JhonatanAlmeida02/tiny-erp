@@ -21,9 +21,13 @@ import json
 import os
 from datetime import datetime, timedelta
 
-# Arquivo onde os checkpoints ficam salvos (mesma pasta TB_bases dos seus CSVs)
+# Pasta onde os checkpoints ficam salvos (mesma pasta TB_bases dos seus CSVs).
+# Cada job tem seu PRÓPRIO arquivo (em vez de um único checkpoints.json
+# compartilhado) justamente pra evitar que dois workflows rodando ao mesmo
+# tempo (ex: estoque e produtos em paralelo) briguem pelo mesmo arquivo
+# quando forem dar commit/push.
 PASTA_DESTINO = "TB_bases"
-ARQUIVO_CHECKPOINT = os.path.join(PASTA_DESTINO, "checkpoints.json")
+PASTA_CHECKPOINTS = os.path.join(PASTA_DESTINO, "checkpoints")
 
 # Formato de data usado pela API do Tiny
 FORMATO_TINY = "%d/%m/%Y %H:%M:%S"
@@ -33,22 +37,27 @@ FORMATO_TINY = "%d/%m/%Y %H:%M:%S"
 MARGEM_SEGURANCA_MINUTOS = 5
 
 
-def _carregar_checkpoints() -> dict:
-    if not os.path.exists(ARQUIVO_CHECKPOINT):
-        return {}
+def _arquivo_checkpoint(job_name: str) -> str:
+    return os.path.join(PASTA_CHECKPOINTS, f"{job_name}.json")
+
+
+def _carregar_checkpoint(job_name: str) -> str | None:
+    caminho = _arquivo_checkpoint(job_name)
+    if not os.path.exists(caminho):
+        return None
     try:
-        with open(ARQUIVO_CHECKPOINT, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(caminho, "r", encoding="utf-8") as f:
+            return json.load(f).get("ultima_execucao")
     except (json.JSONDecodeError, OSError):
         # Arquivo corrompido ou ilegível: melhor recomeçar do zero
         # do que travar a execução do script principal.
-        return {}
+        return None
 
 
-def _salvar_checkpoints(dados: dict) -> None:
-    os.makedirs(PASTA_DESTINO, exist_ok=True)
-    with open(ARQUIVO_CHECKPOINT, "w", encoding="utf-8") as f:
-        json.dump(dados, f, indent=2, ensure_ascii=False)
+def _salvar_checkpoint(job_name: str, valor: str) -> None:
+    os.makedirs(PASTA_CHECKPOINTS, exist_ok=True)
+    with open(_arquivo_checkpoint(job_name), "w", encoding="utf-8") as f:
+        json.dump({"ultima_execucao": valor}, f, indent=2, ensure_ascii=False)
 
 
 def get_last_run(job_name: str) -> str | None:
@@ -59,8 +68,7 @@ def get_last_run(job_name: str) -> str | None:
 
     Retorna None se o job nunca rodou (primeira execução = carga full).
     """
-    dados = _carregar_checkpoints()
-    valor = dados.get(job_name)
+    valor = _carregar_checkpoint(job_name)
     if not valor:
         return None
 
@@ -81,17 +89,14 @@ def set_last_run(job_name: str, momento: datetime | None = None) -> None:
     Chame isso SÓ depois que o processamento terminar com sucesso,
     nunca no início do script.
     """
-    dados = _carregar_checkpoints()
     momento = momento or datetime.now()
-    dados[job_name] = momento.strftime(FORMATO_TINY)
-    _salvar_checkpoints(dados)
+    _salvar_checkpoint(job_name, momento.strftime(FORMATO_TINY))
 
 
 def reset_job(job_name: str) -> None:
     """Remove o checkpoint de um job específico, forçando a próxima
     execução a ser uma carga full novamente. Útil depois de exclusões
     em massa no Tiny, ou pra reconciliar dados periodicamente."""
-    dados = _carregar_checkpoints()
-    if job_name in dados:
-        del dados[job_name]
-        _salvar_checkpoints(dados)
+    caminho = _arquivo_checkpoint(job_name)
+    if os.path.exists(caminho):
+        os.remove(caminho)
