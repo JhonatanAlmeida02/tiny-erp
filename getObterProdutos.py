@@ -385,10 +385,16 @@ def mesclar_com_csv_existente(produtos_novos: list, marca_categoria: dict) -> pd
         df_novo = pd.DataFrame(columns=COLUNAS_FINAIS)
     df_novo["id"] = df_novo["id"].astype(str)
 
-    df_novo["marca"] = df_novo["id"].map(lambda i: marca_categoria.get(i, {}).get("marca", ""))
-    df_novo["categoria"] = df_novo["id"].map(lambda i: marca_categoria.get(i, {}).get("categoria", ""))
-
     df_novo = df_novo.reindex(columns=COLUNAS_FINAIS, fill_value="")
+
+    # Só sobrescreve marca/categoria com o dicionário da etapa 2 quando ele
+    # vier preenchido (modo incremental). Na carga completa, marca_categoria
+    # é {} de propósito — os valores corretos já vieram em produtos_novos
+    # (via produto.obter.php), então NÃO mexemos neles aqui (bug anterior:
+    # sobrescrevia tudo com "" mesmo quando já estava certo).
+    if marca_categoria:
+        df_novo["marca"] = df_novo["id"].map(lambda i: marca_categoria.get(i, {}).get("marca", ""))
+        df_novo["categoria"] = df_novo["id"].map(lambda i: marca_categoria.get(i, {}).get("categoria", ""))
 
     if os.path.exists(OUTPUT_FILE):
         df_existente = pd.read_csv(OUTPUT_FILE, sep=";", dtype=str, encoding="utf-8-sig")

@@ -7,21 +7,26 @@ Em vez disso, usa o endpoint lista.atualizacoes.estoque, que filtra por
 dataAlteracao e devolve, numa única série de chamadas paginadas, só os
 produtos que tiveram estoque alterado (ou criados) desde a última execução.
 
-- Primeira execução (sem checkpoint salvo): carga completa. dataAlteracao é
-  obrigatório neste endpoint, então usamos uma data bem antiga (01/01/2000)
-  — diferente do endpoint de produtos, este NÃO tem trava de 30 dias.
+- Primeira execução (sem checkpoint salvo): a API só aceita dataAlteracao
+  dentro dos últimos ~29 dias (mesma trava do endpoint de produtos, só que
+  não documentada na página oficial). Por isso, sem checkpoint, usamos
+  "hoje menos 29 dias" em vez de uma data bem antiga.
 - Execuções seguintes: só o que mudou desde a última vez.
 - O CSV final é atualizado por upsert (mescla o que mudou com o que já
   existia), não é sobrescrito do zero.
 
 IMPORTANTE: exclusões de produtos no Tiny não aparecem aqui (porque não são
-"alterações"). Rode esse mesmo script periodicamente com reset_job("estoque")
-(ex.: 1x por semana) pra reconciliar exclusões via carga completa.
+"alterações"), e como a API limita a consulta a ~29 dias, produtos cujo
+estoque não mudou nesse intervalo também não vão aparecer aqui. Esse
+endpoint sozinho não reconstrói o catálogo inteiro — ele só relata o que
+mudou recentemente. Rode reset_job("estoque") periodicamente pra tentar
+recapturar o que ficou de fora, sabendo dessa limitação.
 """
 
 import os
 import time
 import unicodedata
+from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
@@ -39,6 +44,10 @@ OUTPUT_FILE = os.path.join(PASTA_DESTINO, "Tb_BaseEstoque_Tiny.csv")
 JOB_NAME = "estoque"
 REQUEST_TIMEOUT = 30
 INTERVALO_SEGUNDOS_API = 0.3
+
+# A API só aceita dataAlteracao dentro dos últimos ~29 dias (mesma trava do
+# endpoint de produtos, só que não documentada na página oficial deste aqui).
+LIMITE_DIAS_ATUALIZACOES = 29
 
 ordem_depositos = ["Padrão", "Varejo", "ML FULL", "Garantia", "Qualidade",
                     "Quarentena", "Shelf Life", "Custo"]
@@ -97,15 +106,28 @@ def coletar_atualizacoes(data_alteracao: str | None):
     todos_produtos = []
     pagina = 1
     total_paginas = None
-    # dataAlteracao é OBRIGATÓRIO neste endpoint (não pode ser omitido).
-    # Sem checkpoint, usamos uma data bem antiga pra simular carga completa
-    # — esse endpoint não tem a trava de 30 dias que o de produtos tem.
-    data_filtro = data_alteracao or "01/01/2000"
+    # dataAlteracao é OBRIGATÓRIO e só aceita datas dentro de ~29 dias atrás.
+    # Sem checkpoint (ou com checkpoint mais antigo que isso), usamos o mais
+    # antigo permitido pela API: hoje menos 29 dias. Isso significa que a
+    # PRIMEIRA carga só traz produtos com alteração de estoque recente,
+    # não o catálogo inteiro (a API não oferece um jeito de listar "tudo",
+    # só "o que mudou").
+    data_minima_aceita = (datetime.now() - timedelta(days=LIMITE_DIAS_ATUALIZACOES)).strftime("%d/%m/%Y")
+
+    if data_alteracao:
+        try:
+            dt_checkpoint = datetime.strptime(data_alteracao, "%d/%m/%Y %H:%M:%S")
+            limite = datetime.now() - timedelta(days=LIMITE_DIAS_ATUALIZACOES)
+            data_filtro = data_alteracao if dt_checkpoint >= limite else data_minima_aceita
+        except ValueError:
+            data_filtro = data_minima_aceita
+    else:
+        data_filtro = data_minima_aceita
 
     while True:
         params = {"token": TOKEN_API, "formato": "json", "pagina": pagina, "dataAlteracao": data_filtro}
 
-        print(f"Buscando página {pagina}" + (f" (desde {data_filtro})" if data_alteracao else " (carga completa)") + "...")
+        print(f"Buscando página {pagina} (desde {data_filtro})...")
         dados = fetch_json(params)
 
         if not dados:
@@ -207,7 +229,8 @@ def main():
     if data_alteracao:
         print(f"🔄 Sincronização incremental: buscando alterações desde {data_alteracao}")
     else:
-        print("🚀 Nenhum checkpoint encontrado: fazendo carga completa (primeira execução).")
+        print(f"🚀 Nenhum checkpoint encontrado: buscando os últimos {LIMITE_DIAS_ATUALIZACOES} dias "
+              f"(a API não permite consultar mais que isso de uma vez).")
 
     inicio = time.time()
     produtos = coletar_atualizacoes(data_alteracao)
