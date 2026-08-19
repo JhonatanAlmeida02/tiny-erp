@@ -1,11 +1,11 @@
 name: Sync Tags Produtos Tiny
 
 on:
-  # Dispara automaticamente assim que "Sync Produtos Tiny" terminar.
-  workflow_run:
-    workflows: ["Sync Produtos Tiny"]
-    types:
-      - completed
+  schedule:
+    # 00h horário de Brasília (UTC-3) = 3h UTC, a cada 2 dias (dias 1,3,5,7... do mês).
+    # Reduz pela metade o consumo de minutos do GitHub Actions, já que esse
+    # script busca tags de TODOS os produtos (não é incremental).
+    - cron: '0 3 */2 * *'
   workflow_dispatch: {}
 
 permissions:
@@ -13,11 +13,6 @@ permissions:
 
 jobs:
   sync:
-    # Só roda se foi disparo manual, OU se "Sync Produtos Tiny" terminou com sucesso
-    # (evita rodar tags em cima de uma base de produtos desatualizada/com erro).
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
