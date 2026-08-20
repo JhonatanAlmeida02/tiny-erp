@@ -35,6 +35,18 @@ jobs:
           TINY_TOKEN: ${{ secrets.TINY_TOKEN }}
         run: python getObterGruposTag.py
 
+      - name: Enviar CSV para o SharePoint (Prodigy Hub)
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          if [ -f TB_bases/Tb_GrupoTag_Tiny.csv ]; then
+            python enviar_sharepoint.py TB_bases/Tb_GrupoTag_Tiny.csv TinyERP prodigyHub
+          else
+            echo "CSV ainda não existe — pulando envio."
+          fi
+
       - name: Salvar CSV atualizado no repositório
         run: |
           git config user.name "github-actions[bot]"

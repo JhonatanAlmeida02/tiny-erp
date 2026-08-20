@@ -26,10 +26,20 @@ TENANT_ID = os.environ.get("AZURE_TENANT_ID", "")
 CLIENT_ID = os.environ.get("AZURE_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("AZURE_CLIENT_SECRET", "")
 
-# Não são segredos (é só o "endereço" do site, público dentro da empresa),
+# Não são segredos (é só o "endereço" dos sites, público dentro da empresa),
 # por isso ficam fixos aqui em vez de precisar virar Secret no GitHub.
-SHAREPOINT_HOSTNAME = "mediprobrasil.sharepoint.com"
-SHAREPOINT_SITE_PATH = "/sites/dpLogistica"
+# Pra adicionar um novo site de destino no futuro, só acrescenta uma entrada
+# neste dicionário.
+SITES = {
+    "dpLogistica": {
+        "hostname": "mediprobrasil.sharepoint.com",
+        "site_path": "/sites/dpLogistica",
+    },
+    "prodigyHub": {
+        "hostname": "mediprobrasil.sharepoint.com",
+        "site_path": "/sites/ProdigyHub",
+    },
+}
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -48,15 +58,16 @@ def _obter_token() -> str:
     return resp.json()["access_token"]
 
 
-def _obter_site_id(token: str) -> str:
+def _obter_site_id(token: str, hostname: str, site_path: str) -> str:
     """Resolve o ID interno do site do SharePoint a partir do hostname + caminho."""
-    url = f"{GRAPH_BASE}/sites/{SHAREPOINT_HOSTNAME}:{SHAREPOINT_SITE_PATH}"
+    url = f"{GRAPH_BASE}/sites/{hostname}:{site_path}"
     resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
     resp.raise_for_status()
     return resp.json()["id"]
 
 
-def upload_to_sharepoint(caminho_local: str, pasta_destino: str, nome_arquivo: str | None = None) -> None:
+def upload_to_sharepoint(caminho_local: str, pasta_destino: str, nome_arquivo: str | None = None,
+                          site: str = "dpLogistica") -> None:
     """
     Envia um arquivo local para uma pasta dentro da biblioteca "Documentos
     Compartilhados" do site do SharePoint configurado. Sobrescreve o arquivo
@@ -64,7 +75,10 @@ def upload_to_sharepoint(caminho_local: str, pasta_destino: str, nome_arquivo: s
 
     pasta_destino: caminho da pasta dentro da biblioteca, ex: "tinyEstoque"
                    (sem barra no início/fim).
+    site: chave do dicionário SITES (ex: "dpLogistica", "prodigyHub").
     """
+    if site not in SITES:
+        raise ValueError(f"Site '{site}' não configurado. Opções: {list(SITES)}")
     if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET):
         raise RuntimeError(
             "Variáveis AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET "
@@ -73,9 +87,10 @@ def upload_to_sharepoint(caminho_local: str, pasta_destino: str, nome_arquivo: s
     if not os.path.exists(caminho_local):
         raise FileNotFoundError(f"Arquivo local não encontrado: {caminho_local}")
 
+    site_config = SITES[site]
     nome_arquivo = nome_arquivo or os.path.basename(caminho_local)
     token = _obter_token()
-    site_id = _obter_site_id(token)
+    site_id = _obter_site_id(token, site_config["hostname"], site_config["site_path"])
 
     url = f"{GRAPH_BASE}/sites/{site_id}/drive/root:/{pasta_destino}/{nome_arquivo}:/content"
 
@@ -89,4 +104,4 @@ def upload_to_sharepoint(caminho_local: str, pasta_destino: str, nome_arquivo: s
         timeout=60,
     )
     resp.raise_for_status()
-    print(f"📤 Enviado para o SharePoint: {pasta_destino}/{nome_arquivo}")
+    print(f"📤 Enviado para o SharePoint ({site}): {pasta_destino}/{nome_arquivo}")

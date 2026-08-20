@@ -34,7 +34,19 @@ jobs:
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
           if [ -f TB_bases/Tb_BaseEstoque_Tiny.csv ]; then
-            python enviar_sharepoint.py TB_bases/Tb_BaseEstoque_Tiny.csv tinyEstoque
+            python enviar_sharepoint.py TB_bases/Tb_BaseEstoque_Tiny.csv tinyEstoque dpLogistica
+          else
+            echo "CSV ainda não existe (nenhum dado coletado ainda) — pulando envio."
+          fi
+
+      - name: Enviar CSV para o SharePoint (Prodigy Hub)
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          if [ -f TB_bases/Tb_BaseEstoque_Tiny.csv ]; then
+            python enviar_sharepoint.py TB_bases/Tb_BaseEstoque_Tiny.csv TinyERP prodigyHub
           else
             echo "CSV ainda não existe (nenhum dado coletado ainda) — pulando envio."
           fi
