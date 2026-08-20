@@ -1,0 +1,57 @@
+name: Carga Completa Única - Estoque Tiny
+
+# Sem "schedule" de propósito — só roda quando você clicar em "Run workflow".
+# É pra usar 1x (ou raramente), pra reconstruir o CSV de estoque inteiro.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar carga completa de estoque (1 chamada por produto)
+        env:
+          TINY_TOKEN: ${{ secrets.TINY_TOKEN }}
+        run: python getObterEstoqueCompleto.py
+
+      - name: Enviar CSV para o SharePoint (DP Logística)
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          if [ -f TB_bases/Tb_BaseEstoque_Tiny.csv ]; then
+            python enviar_sharepoint.py TB_bases/Tb_BaseEstoque_Tiny.csv tinyEstoque
+          fi
+
+      - name: Salvar checkpoint e CSV atualizados no repositório
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add TB_bases/
+          if git diff --staged --quiet; then
+            echo "Nada novo para commitar."
+            exit 0
+          fi
+          git commit -m "Carga completa de estoque [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push; then
+              exit 0
+            fi
+            echo "Push falhou (tentativa $i/5), tentando de novo em instantes..."
+            sleep $((RANDOM % 15 + 5))
+          done
+          echo "Falha ao dar push depois de várias tentativas."
+          exit 1

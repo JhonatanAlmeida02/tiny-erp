@@ -1,33 +1,37 @@
 """
 Get_ObterEstoque_incremental.py
 --------------------------------
-Substitui a lógica antiga de "1 chamada de API por produto, sempre".
+Sincronização de estoque em DOIS MODOS, escolhidos automaticamente (mesmo
+padrão do getObterProdutos.py):
 
-Em vez disso, usa o endpoint lista.atualizacoes.estoque, que filtra por
-dataAlteracao e devolve, numa única série de chamadas paginadas, só os
-produtos que tiveram estoque alterado (ou criados) desde a última execução.
+MODO CARGA COMPLETA (sem checkpoint salvo):
+    Lista TODOS os IDs de produtos (produtos.pesquisa.php) e busca o estoque
+    de cada um individualmente (produto.obter.estoque.php). É o único jeito
+    de reconstruir o catálogo inteiro — o endpoint de "atualizações" abaixo
+    NUNCA lista tudo, só o que mudou recentemente.
 
-- Primeira execução (sem checkpoint salvo): a API só aceita dataAlteracao
-  dentro dos últimos ~29 dias (mesma trava do endpoint de produtos, só que
-  não documentada na página oficial). Por isso, sem checkpoint, usamos
-  "hoje menos 29 dias" em vez de uma data bem antiga.
-- Execuções seguintes: só o que mudou desde a última vez.
-- O CSV final é atualizado por upsert (mescla o que mudou com o que já
-  existia), não é sobrescrito do zero.
+MODO INCREMENTAL (checkpoint existente): lista.atualizacoes.estoque
+    Filtra por dataAlteracao e devolve, paginado, só os produtos que tiveram
+    estoque alterado desde a última execução. MUITO mais barato (poucas
+    chamadas), mas só aceita dataAlteracao dos últimos ~29 dias (trava não
+    documentada oficialmente).
 
-IMPORTANTE: exclusões de produtos no Tiny não aparecem aqui (porque não são
-"alterações"), e como a API limita a consulta a ~29 dias, produtos cujo
-estoque não mudou nesse intervalo também não vão aparecer aqui. Esse
-endpoint sozinho não reconstrói o catálogo inteiro — ele só relata o que
-mudou recentemente. Rode reset_job("estoque") periodicamente pra tentar
-recapturar o que ficou de fora, sabendo dessa limitação.
+- O CSV final é sempre atualizado por upsert (mescla o que veio de novo com
+  o que já existia).
+
+IMPORTANTE: exclusões de produtos no Tiny não aparecem no modo incremental
+(não são "alterações"). Rode reset_job("estoque") periodicamente (apagando
+TB_bases/checkpoints/estoque.json) pra reconciliar via carga completa de novo.
 """
 
+import asyncio
+import json as _json
 import os
 import time
 import unicodedata
 from datetime import datetime, timedelta
 
+import aiohttp
 import pandas as pd
 import requests
 
@@ -38,6 +42,8 @@ TOKEN_API = os.environ.get("TINY_TOKEN", "")
 
 # Sem ".php" no final - o endpoint real da lista.atualizacoes.estoque não usa essa extensão.
 API_URL = "https://api.tiny.com.br/api2/lista.atualizacoes.estoque"
+URL_PESQUISA = "https://api.tiny.com.br/api2/produtos.pesquisa.php"
+URL_OBTER_ESTOQUE = "https://api.tiny.com.br/api2/produto.obter.estoque.php"
 PASTA_DESTINO = "TB_bases"
 OUTPUT_FILE = os.path.join(PASTA_DESTINO, "Tb_BaseEstoque_Tiny.csv")
 
@@ -48,6 +54,13 @@ INTERVALO_SEGUNDOS_API = 0.3
 # A API só aceita dataAlteracao dentro dos últimos ~29 dias (mesma trava do
 # endpoint de produtos, só que não documentada na página oficial deste aqui).
 LIMITE_DIAS_ATUALIZACOES = 29
+
+# Modo carga completa: mesmo limite de 100 req/min da conta, com chamadas
+# assíncronas (igual getObterProdutos.py e getObterTags.py).
+LIMIT_PER_MINUTE = 100
+MAX_CONCURRENT = 8
+MAX_RETRIES = 3
+DELAY_BETWEEN_RETRIES = 5
 
 ordem_depositos = ["Padrão", "Varejo", "ML FULL", "Garantia", "Qualidade",
                     "Quarentena", "Shelf Life", "Custo"]
@@ -65,15 +78,159 @@ mapa_depositos = {
 }
 
 
-def normalizar_nome(nome: str) -> str:
+# ================= MODO CARGA COMPLETA: listar todos os IDs =================
+def listar_todos_ids_pesquisa() -> list:
+    """Lista TODOS os IDs de produtos via produtos.pesquisa.php (paginado,
+    sem filtro de data) — usado só no modo carga completa."""
+    ids = []
+    pagina = 1
+    total_paginas = None
+
+    while True:
+        params = {"token": TOKEN_API, "formato": "json", "pesquisa": "", "pagina": pagina}
+        print(f"[Carga completa] Buscando página {pagina} de IDs...")
+        dados = fetch_json(params, url=URL_PESQUISA)
+
+        if not dados:
+            print(f"Falha ao buscar página {pagina}. Interrompendo.")
+            break
+
+        retorno = dados.get("retorno", {})
+        if retorno.get("status") != "OK":
+            print(f"Erro da API: {retorno.get('erros', [{'erro': 'desconhecido'}])}")
+            break
+
+        if total_paginas is None:
+            total_paginas = int(retorno.get("numero_paginas", 1))
+            print(f"Total de páginas: {total_paginas}")
+
+        produtos_pagina = retorno.get("produtos", [])
+        if not produtos_pagina:
+            break
+
+        ids.extend([str(p["produto"]["id"]) for p in produtos_pagina if "produto" in p])
+        print(f"[Carga completa] Página {pagina}/{total_paginas} - total de IDs até agora: {len(ids)}")
+
+        if pagina >= total_paginas:
+            break
+        pagina += 1
+        time.sleep(INTERVALO_SEGUNDOS_API)
+
+    return ids
+
+
+# ================= MODO CARGA COMPLETA: estoque por ID (assíncrono) =================
+class FastRateLimiter:
+    def __init__(self, max_per_minute=100):
+        self.max_per_minute = max_per_minute
+        self.requests = []
+        self.lock = asyncio.Lock()
+        self.min_interval = 60 / max_per_minute
+        self.last_request = 0
+
+    async def acquire(self):
+        async with self.lock:
+            now = time.time()
+            time_since_last = now - self.last_request
+            if time_since_last < self.min_interval:
+                await asyncio.sleep(self.min_interval - time_since_last)
+                now = time.time()
+            self.requests = [t for t in self.requests if now - t < 60]
+            if len(self.requests) >= self.max_per_minute:
+                wait_time = 61 - (now - self.requests[0])
+                print(f"\n⏸ Limite atingido, aguardando {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+                return await self.acquire()
+            self.requests.append(now)
+            self.last_request = now
+
+
+async def get_estoque_produto(session, produto_id, rate_limiter):
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            await rate_limiter.acquire()
+            params = {"token": TOKEN_API, "id": produto_id, "formato": "json"}
+            async with session.get(URL_OBTER_ESTOQUE, params=params) as response:
+                text = await response.text()
+                try:
+                    data = _json.loads(text)
+                except Exception:
+                    if attempt < MAX_RETRIES:
+                        await asyncio.sleep(DELAY_BETWEEN_RETRIES)
+                        continue
+                    return produto_id, None, f"Resposta inválida: {text[:100]}..."
+                if data.get("retorno", {}).get("status") == "OK":
+                    return produto_id, data["retorno"]["produto"], None
+                erro = data.get("retorno", {}).get("erros", [{"erro": "Erro desconhecido"}])[0]["erro"]
+                if "bloque" in erro.lower() and attempt < MAX_RETRIES:
+                    await asyncio.sleep(DELAY_BETWEEN_RETRIES)
+                    continue
+                return produto_id, None, erro
+        except Exception as e:
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(2)
+                continue
+            return produto_id, None, str(e)
+    return produto_id, None, "Falha após várias tentativas"
+
+
+async def _worker(queue, session, rate_limiter, results, progress, erros):
+    while not queue.empty():
+        try:
+            produto_id = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        pid, detalhe, erro = await get_estoque_produto(session, produto_id, rate_limiter)
+        if detalhe:
+            results.append(detalhe)
+        if erro:
+            erros.append({"id": pid, "erro": erro})
+            print(f"\n❌ Erro no produto {pid}: {erro}")
+        progress["processed"] += 1
+        if progress["processed"] % 100 == 0 or progress["processed"] == progress["total"]:
+            print(f"[Carga completa] {progress['processed']}/{progress['total']} produtos com estoque coletado")
+        queue.task_done()
+
+
+async def buscar_estoques_completos(ids: list) -> list:
+    """Retorna a lista de dicts "produto" (com saldo/depósitos) pra cada ID,
+    respeitando o limite de 100 req/min — usado só no modo carga completa."""
+    if not ids:
+        return []
+
+    rate_limiter = FastRateLimiter(LIMIT_PER_MINUTE)
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, limit_per_host=MAX_CONCURRENT)
+
+    queue = asyncio.Queue()
+    for pid in ids:
+        await queue.put(pid)
+
+    results = []
+    erros = []
+    progress = {"processed": 0, "total": len(ids)}
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        workers = [asyncio.create_task(_worker(queue, session, rate_limiter, results, progress, erros))
+                   for _ in range(MAX_CONCURRENT)]
+        await asyncio.gather(*workers)
+
+    if erros:
+        print(f"⚠️ {len(erros)} produtos falharam ao buscar estoque (veja acima).")
+
+    return results
+
+
+
     return unicodedata.normalize("NFKD", nome).encode("ASCII", "ignore").decode("utf-8").lower().strip()
 
 
 # ================= REQUISIÇÃO COM RETRY =================
-def fetch_json(params, tentativas=3):
+def fetch_json(params, tentativas=3, url=None):
+    url = url or API_URL
     for tentativa in range(1, tentativas + 1):
         try:
-            response = requests.get(API_URL, params=params, timeout=REQUEST_TIMEOUT)
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
             if response.status_code == 429:
                 print("⚠️ 429 Too Many Requests - aguardando 60s...")
                 time.sleep(60)
