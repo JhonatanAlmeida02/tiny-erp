@@ -22,6 +22,7 @@ parou (sem buraco, sem duplicar trabalho).
 import asyncio
 import json
 import os
+import sys
 import time
 import unicodedata
 
@@ -29,6 +30,12 @@ import aiohttp
 import pandas as pd
 
 from checkpoint_utils import set_last_run
+
+# Força a saída a aparecer ao vivo no log do GitHub Actions (sem isso, o
+# Python "segura" a saída em buffer até acumular bastante texto, e como
+# esse script só imprime de vez em quando, o log parece "travado" mesmo
+# estando funcionando normalmente em segundo plano).
+sys.stdout.reconfigure(line_buffering=True)
 
 # ================= CONFIGURAÇÕES =================
 TOKEN_API = os.environ.get("TINY_TOKEN", "")
@@ -70,15 +77,21 @@ class RateLimiter:
         self.lock = asyncio.Lock()
 
     async def acquire(self):
-        async with self.lock:
-            now = time.time()
-            self.requests = [t for t in self.requests if now - t < 60]
-            if len(self.requests) >= self.max_per_minute:
+        while True:
+            wait = 0.0
+            async with self.lock:
+                now = time.time()
+                self.requests = [t for t in self.requests if now - t < 60]
+                if len(self.requests) < self.max_per_minute:
+                    self.requests.append(now)
+                    return
                 wait = 61 - (now - self.requests[0])
-                print(f"⏸ Limite atingido, aguardando {wait:.1f}s...")
-                await asyncio.sleep(wait)
-                return await self.acquire()
-            self.requests.append(now)
+            # O sleep fica FORA do "async with self.lock" de propósito —
+            # se ficasse dentro, a próxima tentativa (abaixo) travaria pra
+            # sempre tentando adquirir um lock que ela mesma ainda segura
+            # (asyncio.Lock não é reentrante).
+            print(f"⏸ Limite atingido, aguardando {wait:.1f}s...")
+            await asyncio.sleep(wait)
 
 
 # ================= BUSCA DE ESTOQUE POR PRODUTO =================
@@ -156,7 +169,7 @@ async def worker(fila, session, rate_limiter, resultados, progresso, erros):
         else:
             erros.append(produto_id)
         progresso["feito"] += 1
-        if progresso["feito"] % 100 == 0 or progresso["feito"] == progresso["total"]:
+        if progresso["feito"] % 25 == 0 or progresso["feito"] == progresso["total"]:
             print(f"[estoque completo] {progresso['feito']}/{progresso['total']} produtos processados")
         fila.task_done()
 

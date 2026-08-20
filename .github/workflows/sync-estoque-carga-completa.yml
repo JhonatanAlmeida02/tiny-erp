@@ -24,6 +24,7 @@ jobs:
       - name: Rodar carga completa de estoque (1 chamada por produto)
         env:
           TINY_TOKEN: ${{ secrets.TINY_TOKEN }}
+          PYTHONUNBUFFERED: "1"
         run: python getObterEstoqueCompleto.py
 
       - name: Enviar CSV para o SharePoint (DP Logística)

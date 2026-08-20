@@ -33,24 +33,30 @@ class FastRateLimiter:
         self.last_request = 0
 
     async def acquire(self):
-        async with self.lock:
-            now = time.time()
-            time_since_last = now - self.last_request
-            if time_since_last < self.min_interval:
-                await asyncio.sleep(self.min_interval - time_since_last)
+        while True:
+            wait_time = 0.0
+            async with self.lock:
                 now = time.time()
+                time_since_last = now - self.last_request
+                if time_since_last < self.min_interval:
+                    await asyncio.sleep(self.min_interval - time_since_last)
+                    now = time.time()
 
-            self.requests = [req_time for req_time in self.requests if now - req_time < 60]
+                self.requests = [req_time for req_time in self.requests if now - req_time < 60]
 
-            if len(self.requests) >= self.max_per_minute:
+                if len(self.requests) < self.max_per_minute:
+                    self.requests.append(now)
+                    self.last_request = now
+                    return
+
                 oldest_request = self.requests[0]
                 wait_time = 61 - (now - oldest_request)
-                print(f"\n⏸ Limite atingido, aguardando {wait_time:.1f}s...")
-                await asyncio.sleep(wait_time)
-                return await self.acquire()
-
-            self.requests.append(now)
-            self.last_request = now
+            # Sleep FORA do "async with self.lock" — dentro dele, a nova
+            # tentativa (próxima volta do while) travaria pra sempre tentando
+            # readquirir um lock que ela mesma ainda estaria segurando
+            # (asyncio.Lock não é reentrante).
+            print(f"\n⏸ Limite atingido, aguardando {wait_time:.1f}s...")
+            await asyncio.sleep(wait_time)
 
 
 # ================= FUNÇÃO DE BUSCA =================
