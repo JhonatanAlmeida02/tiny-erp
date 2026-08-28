@@ -1,13 +1,13 @@
 """
-Get_ObterEstoque_incremental.py
---------------------------------
+getObterEstoque.py
+------------------
 Sincronização de estoque em DOIS MODOS, escolhidos automaticamente (mesmo
 padrão do getObterProdutos.py):
 
 MODO CARGA COMPLETA (sem checkpoint salvo):
-    Lista TODOS os IDs de produtos (produtos.pesquisa.php) e busca o estoque
-    de cada um individualmente (produto.obter.estoque.php). É o único jeito
-    de reconstruir o catálogo inteiro — o endpoint de "atualizações" abaixo
+    Lista TODOS os produtos (produtos.pesquisa.php) e busca o estoque de cada
+    um individualmente (produto.obter.estoque.php). É o único jeito de
+    reconstruir o catálogo inteiro — o endpoint de "atualizações" abaixo
     NUNCA lista tudo, só o que mudou recentemente.
 
 MODO INCREMENTAL (checkpoint existente): lista.atualizacoes.estoque
@@ -20,14 +20,16 @@ MODO INCREMENTAL (checkpoint existente): lista.atualizacoes.estoque
   o que já existia).
 
 IMPORTANTE: exclusões de produtos no Tiny não aparecem no modo incremental
-(não são "alterações"). Rode reset_job("estoque") periodicamente (apagando
-TB_bases/checkpoints/estoque.json) pra reconciliar via carga completa de novo.
+(não são "alterações"). Apague TB_bases/checkpoints/estoque.json
+periodicamente pra reconciliar via carga completa de novo.
 """
 
 import asyncio
 import json as _json
 import os
+import sys
 import time
+import traceback
 import unicodedata
 from datetime import datetime, timedelta
 
@@ -63,7 +65,7 @@ MAX_RETRIES = 3
 DELAY_BETWEEN_RETRIES = 5
 
 ordem_depositos = ["Padrão", "Varejo", "ML FULL", "Garantia", "Qualidade",
-                    "Quarentena", "Shelf Life", "Custo"]
+                   "Quarentena", "Shelf Life", "Custo"]
 
 mapa_depositos = {
     "padrao": "Padrão",
@@ -78,17 +80,64 @@ mapa_depositos = {
 }
 
 
-# ================= MODO CARGA COMPLETA: listar todos os IDs =================
-def listar_todos_ids_pesquisa() -> list:
-    """Lista TODOS os IDs de produtos via produtos.pesquisa.php (paginado,
-    sem filtro de data) — usado só no modo carga completa."""
-    ids = []
+# ================= NORMALIZAÇÃO =================
+def normalizar_nome(nome) -> str:
+    """Remove acentos, caixa e espaços das pontas, pra casar com mapa_depositos.
+    Aceita None/NaN sem estourar (a API às vezes devolve nome de depósito nulo)."""
+    if not nome:
+        return ""
+    return (unicodedata.normalize("NFKD", str(nome))
+            .encode("ASCII", "ignore")
+            .decode("utf-8")
+            .lower()
+            .strip())
+
+
+# ================= REQUISIÇÃO COM RETRY =================
+def fetch_json(params, tentativas=3, url=None):
+    url = url or API_URL
+    for tentativa in range(1, tentativas + 1):
+        try:
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 429:
+                print("⚠️ 429 Too Many Requests - aguardando 60s...")
+                time.sleep(60)
+                continue
+            response.raise_for_status()
+            text = response.text
+            if "API Bloqueada" in text:
+                print("⚠️ API bloqueada - aguardando 60s...")
+                time.sleep(60)
+                continue
+            return response.json()
+        except requests.Timeout:
+            print(f"Timeout ({REQUEST_TIMEOUT}s) na requisição.")
+        except requests.ConnectionError:
+            print("Erro de conexão.")
+        except Exception as e:
+            print(f"Erro na requisição: {e}")
+
+        print(f"Tentativa {tentativa}/{tentativas} falhou. Aguardando 10s...")
+        time.sleep(10)
+    return None
+
+
+# ================= MODO CARGA COMPLETA: listar todos os produtos =================
+def listar_todos_produtos_pesquisa() -> dict:
+    """Lista TODOS os produtos via produtos.pesquisa.php (paginado, sem filtro
+    de data) — usado só no modo carga completa.
+
+    Retorna {id: {"codigo":..., "nome":..., "unidade":...}}. Guardamos esses
+    campos porque produto.obter.estoque.php não devolve código nem unidade;
+    sem isso o CSV da carga completa sairia com colunas vazias.
+    """
+    catalogo = {}
     pagina = 1
     total_paginas = None
 
     while True:
         params = {"token": TOKEN_API, "formato": "json", "pesquisa": "", "pagina": pagina}
-        print(f"[Carga completa] Buscando página {pagina} de IDs...")
+        print(f"[Carga completa] Buscando página {pagina} de produtos...")
         dados = fetch_json(params, url=URL_PESQUISA)
 
         if not dados:
@@ -108,15 +157,28 @@ def listar_todos_ids_pesquisa() -> list:
         if not produtos_pagina:
             break
 
-        ids.extend([str(p["produto"]["id"]) for p in produtos_pagina if "produto" in p])
-        print(f"[Carga completa] Página {pagina}/{total_paginas} - total de IDs até agora: {len(ids)}")
+        for p in produtos_pagina:
+            produto = p.get("produto")
+            if not produto:
+                continue
+            pid = str(produto.get("id", ""))
+            if not pid:
+                continue
+            catalogo[pid] = {
+                "codigo": produto.get("codigo", ""),
+                "nome": produto.get("nome", ""),
+                "unidade": produto.get("unidade", ""),
+            }
+
+        print(f"[Carga completa] Página {pagina}/{total_paginas} - "
+              f"total de produtos até agora: {len(catalogo)}")
 
         if pagina >= total_paginas:
             break
         pagina += 1
         time.sleep(INTERVALO_SEGUNDOS_API)
 
-    return ids
+    return catalogo
 
 
 # ================= MODO CARGA COMPLETA: estoque por ID (assíncrono) =================
@@ -182,6 +244,8 @@ async def _worker(queue, session, rate_limiter, results, progress, erros):
             break
         pid, detalhe, erro = await get_estoque_produto(session, produto_id, rate_limiter)
         if detalhe:
+            # Garante que o ID volte junto: o endpoint nem sempre repete esse campo.
+            detalhe.setdefault("id", pid)
             results.append(detalhe)
         if erro:
             erros.append({"id": pid, "erro": erro})
@@ -221,65 +285,36 @@ async def buscar_estoques_completos(ids: list) -> list:
     return results
 
 
-
-    return unicodedata.normalize("NFKD", nome).encode("ASCII", "ignore").decode("utf-8").lower().strip()
-
-
-# ================= REQUISIÇÃO COM RETRY =================
-def fetch_json(params, tentativas=3, url=None):
-    url = url or API_URL
-    for tentativa in range(1, tentativas + 1):
-        try:
-            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            if response.status_code == 429:
-                print("⚠️ 429 Too Many Requests - aguardando 60s...")
-                time.sleep(60)
-                continue
-            response.raise_for_status()
-            text = response.text
-            if "API Bloqueada" in text:
-                print("⚠️ API bloqueada - aguardando 60s...")
-                time.sleep(60)
-                continue
-            return response.json()
-        except requests.Timeout:
-            print(f"Timeout ({REQUEST_TIMEOUT}s) na requisição.")
-        except requests.ConnectionError:
-            print("Erro de conexão.")
-        except Exception as e:
-            print(f"Erro inesperado: {e}")
-
-        print(f"Tentativa {tentativa}/{tentativas} falhou. Aguardando 10s...")
-        time.sleep(10)
-    return None
-
-
-# ================= COLETA PAGINADA =================
-def coletar_atualizacoes(data_alteracao: str | None):
+# ================= COLETA PAGINADA (INCREMENTAL) =================
+def coletar_atualizacoes(data_alteracao: str):
     """
-    Retorna a lista de dicts "produto" (já desembrulhados) vindos da API.
-    Se data_alteracao for None, faz carga completa (sem filtro de data).
+    Retorna a lista de dicts "produto" (já desembrulhados) vindos da API de
+    atualizações, desde a data do checkpoint.
+
+    dataAlteracao é OBRIGATÓRIO e só aceita datas dentro de ~29 dias atrás.
+    Se o checkpoint for mais antigo que isso, usamos o mais antigo permitido
+    e avisamos — nesse caso pode haver buraco na base, e o certo é apagar o
+    checkpoint pra forçar carga completa.
     """
     todos_produtos = []
     pagina = 1
     total_paginas = None
-    # dataAlteracao é OBRIGATÓRIO e só aceita datas dentro de ~29 dias atrás.
-    # Sem checkpoint (ou com checkpoint mais antigo que isso), usamos o mais
-    # antigo permitido pela API: hoje menos 29 dias. Isso significa que a
-    # PRIMEIRA carga só traz produtos com alteração de estoque recente,
-    # não o catálogo inteiro (a API não oferece um jeito de listar "tudo",
-    # só "o que mudou").
+
     data_minima_aceita = (datetime.now() - timedelta(days=LIMITE_DIAS_ATUALIZACOES)).strftime("%d/%m/%Y")
 
-    if data_alteracao:
-        try:
-            dt_checkpoint = datetime.strptime(data_alteracao, "%d/%m/%Y %H:%M:%S")
-            limite = datetime.now() - timedelta(days=LIMITE_DIAS_ATUALIZACOES)
-            data_filtro = data_alteracao if dt_checkpoint >= limite else data_minima_aceita
-        except ValueError:
+    try:
+        dt_checkpoint = datetime.strptime(data_alteracao, "%d/%m/%Y %H:%M:%S")
+        limite = datetime.now() - timedelta(days=LIMITE_DIAS_ATUALIZACOES)
+        if dt_checkpoint >= limite:
+            data_filtro = data_alteracao
+        else:
             data_filtro = data_minima_aceita
-    else:
+            print(f"⚠️ Checkpoint ({data_alteracao}) é mais antigo que o limite de "
+                  f"{LIMITE_DIAS_ATUALIZACOES} dias da API. Usando {data_filtro}. "
+                  f"Considere apagar o checkpoint pra rodar carga completa.")
+    except ValueError:
         data_filtro = data_minima_aceita
+        print(f"⚠️ Checkpoint em formato inesperado ({data_alteracao}). Usando {data_filtro}.")
 
     while True:
         params = {"token": TOKEN_API, "formato": "json", "pagina": pagina, "dataAlteracao": data_filtro}
@@ -288,8 +323,7 @@ def coletar_atualizacoes(data_alteracao: str | None):
         dados = fetch_json(params)
 
         if not dados:
-            print(f"Falha ao buscar página {pagina}. Interrompendo.")
-            break
+            raise RuntimeError(f"Falha ao buscar página {pagina} após todas as tentativas.")
 
         retorno = dados.get("retorno", {})
         if retorno.get("status") != "OK":
@@ -297,9 +331,8 @@ def coletar_atualizacoes(data_alteracao: str | None):
             mensagens = [e.get("erro", "") for e in erros]
             if any("não retornou registros" in m.lower() for m in mensagens):
                 print("ℹ️ Nenhuma atualização de estoque encontrada nesse período (resultado esperado).")
-            else:
-                print(f"Erro da API: {erros}")
-            break
+                break
+            raise RuntimeError(f"Erro da API na página {pagina}: {erros}")
 
         if total_paginas is None:
             total_paginas = int(retorno.get("numero_paginas", 1))
@@ -327,12 +360,17 @@ def coletar_atualizacoes(data_alteracao: str | None):
 
 
 # ================= PROCESSAMENTO DE CADA PRODUTO =================
-def processar_produto(produto: dict) -> dict:
+def processar_produto(produto: dict, meta: dict = None) -> dict:
+    """Monta a linha do CSV. `meta` traz código/nome/unidade vindos da
+    produtos.pesquisa.php (carga completa), usados só quando o endpoint de
+    estoque não devolve esses campos."""
+    meta = meta or {}
+
     linha = {
-        "ID Produto": produto.get("id", ""),
-        "Código": produto.get("codigo", ""),
-        "Nome": produto.get("nome", ""),
-        "Unidade": produto.get("unidade", ""),
+        "ID Produto": produto.get("id", "") or meta.get("id", ""),
+        "Código": produto.get("codigo", "") or meta.get("codigo", ""),
+        "Nome": produto.get("nome", "") or meta.get("nome", ""),
+        "Unidade": produto.get("unidade", "") or meta.get("unidade", ""),
         "Saldo Total": produto.get("saldo", ""),
         "Saldo Reservado": produto.get("saldoReservado", ""),
     }
@@ -374,31 +412,54 @@ def mesclar_com_csv_existente(linhas_novas: list) -> pd.DataFrame:
     return df_final.reindex(columns=colunas_finais, fill_value="")
 
 
+# ================= MODOS =================
+def executar_carga_completa() -> list:
+    """Reconstrói a base inteira: lista todos os produtos e busca o estoque
+    de cada um. Caro (1 request por produto), mas é o único jeito de ter o
+    catálogo completo."""
+    print("🚀 Nenhum checkpoint encontrado: executando CARGA COMPLETA.")
+    catalogo = listar_todos_produtos_pesquisa()
+
+    if not catalogo:
+        raise RuntimeError("Carga completa não retornou nenhum produto. "
+                           "Verifique o token e a API antes de sobrescrever a base.")
+
+    ids = list(catalogo.keys())
+    print(f"📦 {len(ids)} produtos encontrados. Buscando estoque de cada um "
+          f"(~{len(ids) / LIMIT_PER_MINUTE:.0f} min no limite de {LIMIT_PER_MINUTE} req/min)...")
+
+    produtos = asyncio.run(buscar_estoques_completos(ids))
+    return [processar_produto(p, catalogo.get(str(p.get("id", "")), {})) for p in produtos]
+
+
+def executar_incremental(data_alteracao: str) -> list:
+    print(f"🔄 Sincronização incremental: buscando alterações desde {data_alteracao}")
+    produtos = coletar_atualizacoes(data_alteracao)
+    return [processar_produto(p) for p in produtos]
+
+
 # ================= FUNÇÃO PRINCIPAL =================
 def main():
     if TOKEN_API in ("", "COLOQUE_SEU_TOKEN_AQUI"):
         print("⚠️ Configure o token (variável de ambiente TINY_TOKEN) antes de rodar.")
-        return
+        sys.exit(1)
 
     os.makedirs(PASTA_DESTINO, exist_ok=True)
 
-    data_alteracao = get_last_run(JOB_NAME)
-    if data_alteracao:
-        print(f"🔄 Sincronização incremental: buscando alterações desde {data_alteracao}")
-    else:
-        print(f"🚀 Nenhum checkpoint encontrado: buscando os últimos {LIMITE_DIAS_ATUALIZACOES} dias "
-              f"(a API não permite consultar mais que isso de uma vez).")
-
     inicio = time.time()
-    produtos = coletar_atualizacoes(data_alteracao)
+    data_alteracao = get_last_run(JOB_NAME)
 
-    if not produtos:
+    if data_alteracao:
+        linhas = executar_incremental(data_alteracao)
+    else:
+        linhas = executar_carga_completa()
+
+    if not linhas:
         print("Nenhuma atualização de estoque encontrada nesse período. Nada a fazer.")
         # Ainda assim, atualiza o checkpoint: rodou com sucesso, só não havia mudanças.
         set_last_run(JOB_NAME)
         return
 
-    linhas = [processar_produto(p) for p in produtos]
     df_final = mesclar_com_csv_existente(linhas)
     df_final.to_csv(OUTPUT_FILE, index=False, sep=";", encoding="utf-8-sig")
 
@@ -416,5 +477,10 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nExecução interrompida manualmente. Checkpoint NÃO foi atualizado.")
+        sys.exit(130)
     except Exception as e:
         print(f"Erro inesperado: {e}. Checkpoint NÃO foi atualizado.")
+        traceback.print_exc()
+        # Exit code != 0 pra que o GitHub Actions marque o job como falho e
+        # NÃO publique o CSV antigo no SharePoint como se fosse atualizado.
+        sys.exit(1)
