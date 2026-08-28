@@ -20,6 +20,7 @@ guardados no mesmo arquivo JSON.
 import json
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # Pasta onde os checkpoints ficam salvos (mesma pasta TB_bases dos seus CSVs).
 # Cada job tem seu PRÓPRIO arquivo (em vez de um único checkpoints.json
@@ -32,9 +33,20 @@ PASTA_CHECKPOINTS = os.path.join(PASTA_DESTINO, "checkpoints")
 # Formato de data usado pela API do Tiny
 FORMATO_TINY = "%d/%m/%Y %H:%M:%S"
 
+# Fuso de referência. O runner do GitHub Actions roda em UTC, então um
+# datetime.now() "pelado" gravava o checkpoint 3h no futuro em relação ao
+# horário que a API do Tiny entende — e a sincronização seguinte pulava
+# tudo que tivesse mudado nessa janela de 3h. Sempre use agora() aqui.
+FUSO_TINY = ZoneInfo("America/Sao_Paulo")
+
 # Margem de segurança: subtrai alguns minutos do checkpoint salvo,
 # pra não perder alterações que aconteceram bem no meio da execução anterior.
 MARGEM_SEGURANCA_MINUTOS = 5
+
+
+def agora() -> datetime:
+    """Horário atual no fuso de Brasília, independente do fuso da máquina."""
+    return datetime.now(FUSO_TINY)
 
 
 def _arquivo_checkpoint(job_name: str) -> str:
@@ -84,12 +96,13 @@ def get_last_run(job_name: str) -> str | None:
 def set_last_run(job_name: str, momento: datetime | None = None) -> None:
     """
     Salva o momento da execução atual como novo checkpoint do job.
-    Se `momento` não for passado, usa datetime.now().
+    Se `momento` não for passado, usa o horário de Brasília (nunca o da
+    máquina, que no GitHub Actions é UTC).
 
     Chame isso SÓ depois que o processamento terminar com sucesso,
     nunca no início do script.
     """
-    momento = momento or datetime.now()
+    momento = momento or agora()
     _salvar_checkpoint(job_name, momento.strftime(FORMATO_TINY))
 
 
@@ -99,4 +112,4 @@ def reset_job(job_name: str) -> None:
     em massa no Tiny, ou pra reconciliar dados periodicamente."""
     caminho = _arquivo_checkpoint(job_name)
     if os.path.exists(caminho):
-        os.remove(caminho)
+        os.remove(caminho)

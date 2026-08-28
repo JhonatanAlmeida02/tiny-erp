@@ -6,7 +6,6 @@ import os
 import sys
 import time
 import json
-from datetime import datetime
 
 # ================= CONFIGURAÇÕES =================
 TOKEN = os.environ.get("TINY_TOKEN", "")
@@ -199,7 +198,7 @@ async def main():
     elapsed = end_time - start_time
     avg_rate = len(results) / elapsed * 60 if elapsed > 0 else 0
     
-    print(f"\n✅ Coleta de tags concluída!")
+    print("\n✅ Coleta de tags concluída!")
     print(f"📄 CSV salvo: {OUTPUT_FILE}")
     print(f"⏱ Tempo total: {elapsed:.1f}s ({elapsed/60:.1f}min)")
     print(f"⚡ Taxa média: {avg_rate:.1f} requisições/minuto")

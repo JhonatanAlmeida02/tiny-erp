@@ -44,7 +44,7 @@ import aiohttp
 import pandas as pd
 import requests
 
-from checkpoint_utils import get_last_run, set_last_run
+from checkpoint_utils import agora, get_last_run, set_last_run
 
 # ================= CONFIGURAÇÕES =================
 TOKEN_API = os.environ.get("TINY_TOKEN", "")
@@ -122,7 +122,7 @@ def checkpoint_dentro_do_limite(data_alteracao: str | None) -> bool:
         dt = datetime.strptime(data_alteracao, "%d/%m/%Y %H:%M:%S")
     except ValueError:
         return False
-    limite = datetime.now() - timedelta(days=LIMITE_DIAS_ATUALIZACOES)
+    limite = agora().replace(tzinfo=None) - timedelta(days=LIMITE_DIAS_ATUALIZACOES)
     return dt >= limite
 
 
@@ -476,4 +476,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nExecução interrompida manualmente. Checkpoint NÃO foi atualizado.")
     except Exception as e:
-        print(f"Erro inesperado: {e}. Checkpoint NÃO foi atualizado.")
+        print(f"Erro inesperado: {e}. Checkpoint NÃO foi atualizado.")

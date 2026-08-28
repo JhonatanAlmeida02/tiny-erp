@@ -37,7 +37,11 @@ import aiohttp
 import pandas as pd
 import requests
 
-from checkpoint_utils import get_last_run, set_last_run
+from checkpoint_utils import agora, get_last_run, set_last_run
+
+# Sem isso o Python segura a saida em buffer e o log do GitHub Actions
+# parece travado ate o script terminar.
+sys.stdout.reconfigure(line_buffering=True)
 
 # ================= CONFIGURAÇÕES =================
 TOKEN_API = os.environ.get("TINY_TOKEN", "")
@@ -300,11 +304,11 @@ def coletar_atualizacoes(data_alteracao: str):
     pagina = 1
     total_paginas = None
 
-    data_minima_aceita = (datetime.now() - timedelta(days=LIMITE_DIAS_ATUALIZACOES)).strftime("%d/%m/%Y")
+    data_minima_aceita = (agora() - timedelta(days=LIMITE_DIAS_ATUALIZACOES)).strftime("%d/%m/%Y")
 
     try:
         dt_checkpoint = datetime.strptime(data_alteracao, "%d/%m/%Y %H:%M:%S")
-        limite = datetime.now() - timedelta(days=LIMITE_DIAS_ATUALIZACOES)
+        limite = agora().replace(tzinfo=None) - timedelta(days=LIMITE_DIAS_ATUALIZACOES)
         if dt_checkpoint >= limite:
             data_filtro = data_alteracao
         else:
