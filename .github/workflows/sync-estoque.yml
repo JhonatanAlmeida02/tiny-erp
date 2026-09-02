@@ -1,12 +1,7 @@
 name: Sync Estoque Tiny
 
 on:
-  schedule:
-    # 17 min de cada hora, das 8h17 às 17h17 (BRT) = 11h17 às 20h17 UTC.
-    # O minuto 17 (em vez do 0) reduz a chance do GitHub atrasar ou pular
-    # o agendamento, já que o minuto 0 é o horário mais disputado da fila.
-    - cron: '17 11-20 * * *'
-  workflow_dispatch: {}   # permite rodar manualmente pela aba Actions
+  workflow_dispatch: {}   # agendamento externo via cron-job.org
 
 permissions:
   contents: write
