@@ -2,22 +2,41 @@ name: Sync Estoque Tiny
 
 on:
   schedule:
-    # De hora em hora, das 8h às 17h horário de Brasília (UTC-3) = 11h às 20h UTC
+    # 17 min de cada hora, das 8h17 às 17h17 (BRT) = 11h17 às 20h17 UTC.
+    # O minuto 17 (em vez do 0) reduz a chance do GitHub atrasar ou pular
+    # o agendamento, já que o minuto 0 é o horário mais disputado da fila.
     - cron: '17 11-20 * * *'
   workflow_dispatch: {}   # permite rodar manualmente pela aba Actions
 
 permissions:
   contents: write
 
+# Impede que este workflow rode ao mesmo tempo que os outros que escrevem
+# em TB_bases/ (produtos, tags, etc.). Para funcionar, o MESMO group precisa
+# ser adicionado nos outros workflows.
+concurrency:
+  group: tb-bases-push
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 30   # evita runner pendurado se a API do Tiny travar
+
+    env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # histórico completo: necessário para o rebase no fim
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
       - name: Instalar dependências
         run: pip install -r requirements.txt
@@ -28,30 +47,19 @@ jobs:
         run: python getObterEstoque.py
 
       - name: Enviar CSV para o SharePoint (DP Logística)
-        env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: |
-          if [ -f TB_bases/Tb_BaseEstoque_Tiny.csv ]; then
-            python enviar_sharepoint.py TB_bases/Tb_BaseEstoque_Tiny.csv tinyEstoque dpLogistica
-          else
-            echo "CSV ainda não existe (nenhum dado coletado ainda) — pulando envio."
-          fi
+        if: hashFiles('TB_bases/Tb_BaseEstoque_Tiny.csv') != ''
+        run: python enviar_sharepoint.py TB_bases/Tb_BaseEstoque_Tiny.csv tinyEstoque dpLogistica
 
       - name: Enviar CSV para o SharePoint (Prodigy Hub)
-        env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: |
-          if [ -f TB_bases/Tb_BaseEstoque_Tiny.csv ]; then
-            python enviar_sharepoint.py TB_bases/Tb_BaseEstoque_Tiny.csv TinyERP prodigyHub
-          else
-            echo "CSV ainda não existe (nenhum dado coletado ainda) — pulando envio."
-          fi
+        # !cancelled() garante que este envio aconteça mesmo se o anterior falhar
+        if: ${{ !cancelled() && hashFiles('TB_bases/Tb_BaseEstoque_Tiny.csv') != '' }}
+        run: python enviar_sharepoint.py TB_bases/Tb_BaseEstoque_Tiny.csv TinyERP prodigyHub
 
       - name: Salvar checkpoint e CSV atualizados no repositório
+        # Roda mesmo se o envio ao SharePoint falhar: o checkpoint precisa ser
+        # salvo de qualquer jeito, senão as chamadas já feitas à API do Tiny
+        # são perdidas e o próximo run refaz tudo do zero.
+        if: ${{ !cancelled() }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -65,9 +73,12 @@ jobs:
           # e agora, o push abaixo seria rejeitado. Por isso: puxa com rebase
           # e tenta de novo, algumas vezes, antes de desistir.
           for i in 1 2 3 4 5; do
-            if git pull --rebase origin main && git push; then
+            if git pull --rebase origin main && git push origin HEAD:main; then
               exit 0
             fi
+            # Se o rebase parou no meio (conflito), precisa abortar — senão as
+            # tentativas seguintes falham direto com "rebase in progress".
+            git rebase --abort 2>/dev/null || true
             echo "Push falhou (tentativa $i/5), tentando de novo em instantes..."
             sleep $((RANDOM % 15 + 5))
           done
