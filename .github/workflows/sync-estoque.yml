@@ -3,7 +3,7 @@ name: Sync Estoque Tiny
 on:
   schedule:
     # De hora em hora, das 8h às 17h horário de Brasília (UTC-3) = 11h às 20h UTC
-    - cron: '0 11-20 * * *'
+    - cron: '17 11-20 * * *'
   workflow_dispatch: {}   # permite rodar manualmente pela aba Actions
 
 permissions:
