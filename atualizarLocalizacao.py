@@ -203,6 +203,13 @@ async def processar_um(session, produto_id: str, nova_localizacao: str, rate_lim
         return produto_id, "Erro", (f"Tentativa mínima falhou ({msg}) e não foi "
                                      f"possível buscar dados completos: {erro_obter}")
 
+    # Diagnóstico: mostra no log exatamente o que veio de produto.obter.php
+    # pros campos de fallback, pra facilitar identificar campos ausentes/vazios.
+    diagnostico = ", ".join(
+        f"{c}={produto_atual.get(c, '<ausente>')!r}" for c in CAMPOS_FALLBACK
+    )
+    print(f"ℹ️ [{produto_id}] Campos obtidos via produto.obter.php: {diagnostico}")
+
     payload = {"sequencia": "1", "id": produto_id, "localizacao": nova_localizacao}
     for campo in CAMPOS_FALLBACK:
         if campo in produto_atual and produto_atual[campo] not in (None, ""):
