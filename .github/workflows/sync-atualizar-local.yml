@@ -1,7 +1,8 @@
 name: Atualizar Localização de Produto (Tiny)
 
-# Cria um formulário nativo na aba "Actions" do GitHub (e no app mobile):
-# Actions → "Atualizar Localização de Produto (Tiny)" → botão "Run workflow"
+# Dois gatilhos:
+# 1) workflow_dispatch: formulário manual na aba Actions (fallback)
+# 2) repository_dispatch: disparado pelo Power Automate (evento "atualizar-localizacao")
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +14,8 @@ on:
         description: "Nova localização (ex: Corredor 3, Prateleira B)"
         required: true
         type: string
+  repository_dispatch:
+    types: [atualizar-localizacao]
 
 jobs:
   atualizar:
@@ -32,7 +35,10 @@ jobs:
       - name: Atualizar localização do produto
         env:
           TINY_TOKEN: ${{ secrets.TINY_TOKEN }}
+          # Pega do payload (Power Automate) ou do formulário manual
+          PRODUTO_ID: ${{ github.event.client_payload.id || inputs.produto_id }}
+          LOCALIZACAO: ${{ github.event.client_payload.localizacao || inputs.localizacao }}
         run: |
           python atualizarLocalizacao.py \
-            --id "${{ inputs.produto_id }}" \
-            --localizacao "${{ inputs.localizacao }}"
+            --id "$PRODUTO_ID" \
+            --localizacao "$LOCALIZACAO"
