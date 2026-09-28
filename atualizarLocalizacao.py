@@ -63,8 +63,7 @@ DELAY_BETWEEN_RETRIES = 5
 # Campos que a doc oficial marca como "obrigatório" na tabela de alterar
 # produto. Só são reenviados se a tentativa mínima (passo 1) for recusada
 # pedindo algum deles.
-CAMPOS_FALLBACK = ["nome", "unidade", "preco", "origem", "situacao", "tipo"]
-
+CAMPOS_FALLBACK = ["nome", "unidade", "preco", "origem", "situacao", "tipo", "codigo"]
 
 # ================= RATE LIMITER (mesmo padrão do getObterEstoque.py) =====
 class FastRateLimiter:
