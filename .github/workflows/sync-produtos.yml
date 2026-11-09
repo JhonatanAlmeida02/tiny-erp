@@ -4,7 +4,17 @@ on:
   schedule:
     # 22h horário de Brasília (UTC-3) = 1h UTC do dia seguinte
     - cron: '0 1 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      carga_completa:
+        description: 'Refazer a base inteira (preenche todos os campos em todos os produtos; ~45 min)'
+        type: boolean
+        default: false
+
+# Nunca roda duas sincronizações de produtos ao mesmo tempo (a segunda espera a primeira)
+concurrency:
+  group: sync-produtos
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -25,6 +35,9 @@ jobs:
       - name: Rodar sincronização de produtos
         env:
           TINY_TOKEN: ${{ secrets.TINY_TOKEN }}
+          FORCAR_CARGA_COMPLETA: ${{ inputs.carga_completa && '1' || '' }}
+          # na carga completa usa 60/min para sobrar cota para o Sync Estoque e o agente (plano: 120/min)
+          TINY_LIMITE_MINUTO: ${{ inputs.carga_completa && '60' || '100' }}
         run: python getObterProdutos.py
 
       - name: Enviar CSV para o SharePoint (Prodigy Hub)
