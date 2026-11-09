@@ -68,8 +68,10 @@ REQUEST_TIMEOUT = 30
 INTERVALO_SEGUNDOS_ETAPA1 = 0.65  # ~92 req/min
 
 # Etapa 2 é assíncrona (pode ser MUITAS chamadas, uma por produto alterado)
-LIMIT_PER_MINUTE = 100
+LIMIT_PER_MINUTE = int(os.environ.get("TINY_LIMITE_MINUTO", "100"))
 MAX_CONCURRENT = 8
+# FORCAR_CARGA_COMPLETA=1 refaz a base inteira (preenche os campos novos em todos os produtos).
+FORCAR_CARGA_COMPLETA = os.environ.get("FORCAR_CARGA_COMPLETA", "").strip().lower() in ("1", "true", "sim", "yes")
 MAX_RETRIES = 3
 DELAY_BETWEEN_RETRIES = 5
 
@@ -83,7 +85,18 @@ COLUNAS_FINAIS = [
     "classe_ipi", "valor_ipi_fixo", "cod_lista_servicos", "obs",
     "data_alteracao",
     "marca", "categoria",  # vêm da etapa 2 (produto.obter.php)
+    # ---- demais campos do cadastro (produto.obter.php), acrescentados no fim ----
+    "data_criacao", "preco_custo_medio", "garantia", "cest",
+    "id_produto_pai", "classe_produto", "sob_encomenda", "dias_preparacao",
+    "tipo_embalagem", "altura_embalagem", "largura_embalagem",
+    "comprimento_embalagem", "diametro_embalagem",
+    "grade", "variacoes", "kit",
+    "imagem_principal", "anexos", "imagens_externas",
+    "seo_title", "seo_keywords", "seo_description", "link_video", "slug",
+    "mapeamentos",
 ]
+# Listas viram texto legível numa célula, separadas por " | ".
+SEP_LISTA = " | "
 
 
 # ================= ETAPA 1: lista.atualizacoes.produtos (síncrono) =================
@@ -331,50 +344,129 @@ async def buscar_detalhes_completos(ids: list, label: str = "produtos") -> dict:
     return results
 
 
-async def buscar_marca_categoria(ids: list) -> dict:
-    """Retorna {id: {"marca": ..., "categoria": ...}} só para os IDs informados."""
-    detalhes = await buscar_detalhes_completos(ids, label="Etapa 2")
-    return {
-        str(pid): {"marca": d.get("marca", ""), "categoria": d.get("categoria", "")}
-        for pid, d in detalhes.items()
-    }
+def _primeiro(d: dict, *chaves, padrao=""):
+    """Primeiro valor presente entre os nomes possíveis (a API mistura
+    snake_case e camelCase: tipo_variacao x tipoVariacao)."""
+    for k in chaves:
+        v = d.get(k)
+        if v not in (None, ""):
+            return v
+    return padrao
+
+
+def _desembrulhar(item, chave):
+    """A API v2 embrulha itens de lista: {"anexo": "url"}, {"item": {...}}."""
+    if isinstance(item, dict) and chave in item:
+        return item[chave]
+    return item
+
+
+def _texto_grade(grade) -> str:
+    """Grade chave-valor -> "Cor: Azul, Tamanho: P"."""
+    if not grade:
+        return ""
+    if isinstance(grade, dict):
+        return ", ".join(f"{k}: {v}" for k, v in grade.items())
+    if isinstance(grade, list):
+        partes = []
+        for g in grade:
+            if isinstance(g, dict):
+                partes.extend(f"{k}: {v}" for k, v in g.items())
+            elif g not in (None, ""):
+                partes.append(str(g))
+        return ", ".join(partes)
+    return str(grade)
+
+
+def _lista(valores) -> str:
+    return SEP_LISTA.join(str(v) for v in valores if v not in (None, ""))
 
 
 def montar_linha_do_detalhe(detalhe: dict) -> dict:
-    """Extrai de um retorno completo de produto.obter.php os campos que
-    usamos no CSV final (tolera campos ausentes)."""
+    """Extrai de um retorno completo de produto.obter.php TODOS os campos do
+    cadastro que vão para o CSV final (tolera campos ausentes)."""
+    d = detalhe or {}
+    anexos = [_desembrulhar(a, "anexo") for a in (d.get("anexos") or [])]
+    anexos = [a.get("url", "") if isinstance(a, dict) else a for a in anexos]
+    externas = []
+    for im in d.get("imagens_externas") or []:
+        im = _desembrulhar(im, "imagem_externa")
+        externas.append(im.get("url", "") if isinstance(im, dict) else im)
+    variacoes = []
+    for v in d.get("variacoes") or []:
+        v = _desembrulhar(v, "variacao") or {}
+        if isinstance(v, dict):
+            g = _texto_grade(v.get("grade"))
+            variacoes.append(f"{v.get('codigo') or v.get('id', '')}" + (f" ({g})" if g else ""))
+    kit = []
+    for it in d.get("kit") or []:
+        it = _desembrulhar(it, "item") or {}
+        if isinstance(it, dict):
+            kit.append(f"{it.get('id_produto', '')} x {it.get('quantidade', '')}")
+    mapeamentos = []
+    for m in d.get("mapeamentos") or []:
+        m = _desembrulhar(m, "mapeamento") or {}
+        if isinstance(m, dict):
+            mapeamentos.append(f"{m.get('idEcommerce', '')}:{m.get('skuMapeamento', '')}")
     return {
-        "id": detalhe.get("id", ""),
-        "nome": detalhe.get("nome", ""),
-        "codigo": detalhe.get("codigo", ""),
-        "unidade": detalhe.get("unidade", ""),
-        "localizacao": detalhe.get("localizacao", ""),
-        "preco": detalhe.get("preco", ""),
-        "preco_promocional": detalhe.get("preco_promocional", ""),
-        "preco_custo": detalhe.get("preco_custo", ""),
-        "descricao_complementar": detalhe.get("descricao_complementar", ""),
-        "ncm": detalhe.get("ncm", ""),
-        "origem": detalhe.get("origem", ""),
-        "gtin": detalhe.get("gtin", ""),
-        "gtin_embalagem": detalhe.get("gtin_embalagem", ""),
-        "peso_liquido": detalhe.get("peso_liquido", ""),
-        "peso_bruto": detalhe.get("peso_bruto", ""),
-        "estoque_minimo": detalhe.get("estoque_minimo", ""),
-        "estoque_maximo": detalhe.get("estoque_maximo", ""),
-        "id_fornecedor": detalhe.get("id_fornecedor", ""),
-        "codigo_fornecedor": detalhe.get("codigo_fornecedor", ""),
-        "codigo_pelo_fornecedor": detalhe.get("codigo_pelo_fornecedor", ""),
-        "unidade_por_caixa": detalhe.get("unidade_por_caixa", ""),
-        "situacao": detalhe.get("situacao", ""),
-        "tipo": detalhe.get("tipo", detalhe.get("classe_produto", "")),
-        "tipo_variacao": detalhe.get("tipo_variacao", ""),
-        "classe_ipi": detalhe.get("classe_ipi", ""),
-        "valor_ipi_fixo": detalhe.get("valor_ipi_fixo", ""),
-        "cod_lista_servicos": detalhe.get("cod_lista_servicos", ""),
-        "obs": detalhe.get("obs", ""),
-        "data_alteracao": detalhe.get("data_alteracao", ""),
-        "marca": detalhe.get("marca", ""),
-        "categoria": detalhe.get("categoria", ""),
+        "id": d.get("id", ""),
+        "nome": d.get("nome", ""),
+        "codigo": d.get("codigo", ""),
+        "unidade": d.get("unidade", ""),
+        "localizacao": d.get("localizacao", ""),
+        "preco": d.get("preco", ""),
+        "preco_promocional": d.get("preco_promocional", ""),
+        "preco_custo": d.get("preco_custo", ""),
+        "descricao_complementar": d.get("descricao_complementar", ""),
+        "ncm": d.get("ncm", ""),
+        "origem": d.get("origem", ""),
+        "gtin": d.get("gtin", ""),
+        "gtin_embalagem": d.get("gtin_embalagem", ""),
+        "peso_liquido": d.get("peso_liquido", ""),
+        "peso_bruto": d.get("peso_bruto", ""),
+        "estoque_minimo": d.get("estoque_minimo", ""),
+        "estoque_maximo": d.get("estoque_maximo", ""),
+        "id_fornecedor": d.get("id_fornecedor", ""),
+        "codigo_fornecedor": d.get("codigo_fornecedor", ""),
+        "codigo_pelo_fornecedor": d.get("codigo_pelo_fornecedor", ""),
+        "unidade_por_caixa": d.get("unidade_por_caixa", ""),
+        "situacao": d.get("situacao", ""),
+        "tipo": d.get("tipo", d.get("classe_produto", "")),
+        # produto.obter devolve "tipoVariacao" (camelCase); antes ficava vazio na carga completa
+        "tipo_variacao": _primeiro(d, "tipo_variacao", "tipoVariacao"),
+        "classe_ipi": d.get("classe_ipi", ""),
+        "valor_ipi_fixo": d.get("valor_ipi_fixo", ""),
+        "cod_lista_servicos": d.get("cod_lista_servicos", ""),
+        "obs": d.get("obs", ""),
+        "data_alteracao": _primeiro(d, "data_alteracao", "dataAlteracao"),
+        "marca": d.get("marca", ""),
+        "categoria": d.get("categoria", ""),
+        # ---- campos novos ----
+        "data_criacao": _primeiro(d, "data_criacao", "dataCriacao"),
+        "preco_custo_medio": d.get("preco_custo_medio", ""),
+        "garantia": d.get("garantia", ""),
+        "cest": d.get("cest", ""),
+        "id_produto_pai": _primeiro(d, "idProdutoPai", "id_produto_pai"),
+        "classe_produto": d.get("classe_produto", ""),
+        "sob_encomenda": d.get("sob_encomenda", ""),
+        "dias_preparacao": d.get("dias_preparacao", ""),
+        "tipo_embalagem": _primeiro(d, "tipoEmbalagem", "tipo_embalagem"),
+        "altura_embalagem": _primeiro(d, "alturaEmbalagem", "altura_embalagem"),
+        "largura_embalagem": _primeiro(d, "larguraEmbalagem", "largura_embalagem"),
+        "comprimento_embalagem": _primeiro(d, "comprimentoEmbalagem", "comprimento_embalagem"),
+        "diametro_embalagem": _primeiro(d, "diametroEmbalagem", "diametro_embalagem"),
+        "grade": _texto_grade(d.get("grade")),
+        "variacoes": _lista(variacoes),
+        "kit": _lista(kit),
+        "imagem_principal": next((u for u in anexos + externas if u), ""),
+        "anexos": _lista(anexos),
+        "imagens_externas": _lista(externas),
+        "seo_title": d.get("seo_title", ""),
+        "seo_keywords": d.get("seo_keywords", ""),
+        "seo_description": d.get("seo_description", ""),
+        "link_video": d.get("link_video", ""),
+        "slug": d.get("slug", ""),
+        "mapeamentos": _lista(mapeamentos),
     }
 
 
@@ -399,6 +491,13 @@ def mesclar_com_csv_existente(produtos_novos: list, marca_categoria: dict) -> pd
     if os.path.exists(OUTPUT_FILE):
         df_existente = pd.read_csv(OUTPUT_FILE, sep=";", dtype=str, encoding="utf-8-sig")
         df_existente["id"] = df_existente["id"].astype(str)
+        # produto.obter não devolve data_alteracao (e às vezes tipo_variacao):
+        # se o valor novo vier vazio, mantém o que já estava na base
+        antigos = df_existente.drop_duplicates("id", keep="last").set_index("id")
+        for campo in ("data_alteracao", "tipo_variacao"):
+            if campo in antigos.columns:
+                vazio = df_novo[campo].fillna("").astype(str).str.strip() == ""
+                df_novo.loc[vazio, campo] = df_novo.loc[vazio, "id"].map(antigos[campo]).fillna("")
         df_existente = df_existente[~df_existente["id"].isin(df_novo["id"])]
         df_final = pd.concat([df_existente, df_novo], ignore_index=True)
     else:
@@ -418,7 +517,10 @@ def main():
     data_alteracao = get_last_run(JOB_NAME)
     inicio = time.time()
 
-    if checkpoint_dentro_do_limite(data_alteracao):
+    if FORCAR_CARGA_COMPLETA:
+        print("🧹 FORCAR_CARGA_COMPLETA ligado: refazendo a base inteira com todos os campos.")
+
+    if checkpoint_dentro_do_limite(data_alteracao) and not FORCAR_CARGA_COMPLETA:
         # ================= MODO INCREMENTAL =================
         print(f"🔄 Sincronização incremental: buscando produtos alterados desde {data_alteracao}")
 
@@ -429,10 +531,23 @@ def main():
             return
 
         ids_alvo = [str(p["id"]) for p in produtos if p.get("id")]
-        print(f"\n[Etapa 2] Buscando marca/categoria para {len(ids_alvo)} produtos...")
-        marca_categoria = asyncio.run(buscar_marca_categoria(ids_alvo))
+        print(f"\n[Etapa 2] Buscando o cadastro completo de {len(ids_alvo)} produtos...")
+        detalhes = asyncio.run(buscar_detalhes_completos(ids_alvo, label="Etapa 2"))
 
-        df_final = mesclar_com_csv_existente(produtos, marca_categoria)
+        linhas = []
+        for p in produtos:
+            pid = str(p.get("id", ""))
+            if pid in detalhes:
+                linha = montar_linha_do_detalhe(detalhes[pid])
+                # a etapa 1 traz data_alteracao e tipo_variacao no formato da base: têm prioridade
+                for campo in ("data_alteracao", "tipo_variacao"):
+                    if p.get(campo) not in (None, ""):
+                        linha[campo] = p[campo]
+            else:
+                linha = dict(p)  # detalhe falhou: fica com os campos da etapa 1 (como antes)
+            linhas.append(linha)
+
+        df_final = mesclar_com_csv_existente(linhas, {})
         total_processados = len(produtos)
 
     else:
@@ -476,4 +591,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nExecução interrompida manualmente. Checkpoint NÃO foi atualizado.")
     except Exception as e:
-        print(f"Erro inesperado: {e}. Checkpoint NÃO foi atualizado.")
+        print(f"Erro inesperado: {e}. Checkpoint NÃO foi atualizado.")
