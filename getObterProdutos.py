@@ -52,6 +52,9 @@ TOKEN_API = os.environ.get("TINY_TOKEN", "")
 URL_ATUALIZACOES = "https://api.tiny.com.br/api2/lista.atualizacoes.produtos"
 URL_PESQUISA = "https://api.tiny.com.br/api2/produtos.pesquisa.php"
 URL_OBTER = "https://api.tiny.com.br/api2/produto.obter.php"
+URL_CONTATO = "https://api.tiny.com.br/api2/contato.obter.php"
+ARQ_PRODUTOS_TAG = os.path.join("TB_bases", "Tb_ProdutosTag_Tiny.csv")
+ARQ_GRUPO_TAG = os.path.join("TB_bases", "Tb_GrupoTag_Tiny.csv")
 
 # O endpoint lista.atualizacoes.produtos só aceita datas de até 29 dias atrás.
 # Se o checkpoint for mais antigo que isso (ou não existir), cai pra carga completa.
@@ -94,6 +97,9 @@ COLUNAS_FINAIS = [
     "imagem_principal", "anexos", "imagens_externas",
     "seo_title", "seo_keywords", "seo_description", "link_video", "slug",
     "mapeamentos",
+    # ---- complementos (também da API v2, montados no fim de cada sincronização) ----
+    "fornecedor_nome",  # nome do fornecedor principal (contato.obter.php)
+    "tags",             # "Grupo: Tag | Grupo: Tag" (bases de tags do próprio repositório)
 ]
 # Listas viram texto legível numa célula, separadas por " | ".
 SEP_LISTA = " | "
@@ -142,6 +148,13 @@ def checkpoint_dentro_do_limite(data_alteracao: str | None) -> bool:
 def listar_todos_ids_pesquisa() -> list:
     """Modo carga completa - etapa 1 alternativa: lista TODOS os IDs de produtos
     via produtos.pesquisa.php (paginado), sem filtro de data."""
+    return [str(p["id"]) for p in listar_pesquisa()]
+
+
+def listar_pesquisa() -> list:
+    """Lista TODOS os produtos via produtos.pesquisa.php (100 por página).
+    Cada item traz id, nome, codigo, preços, tipoVariacao, situacao e data_criacao
+    (o produto.obter.php não devolve a data de criação; esta pesquisa devolve)."""
     ids = []
     pagina = 1
     total_paginas = None
@@ -168,7 +181,7 @@ def listar_todos_ids_pesquisa() -> list:
         if not produtos_pagina:
             break
 
-        ids.extend([str(p["produto"]["id"]) for p in produtos_pagina if "produto" in p])
+        ids.extend([p["produto"] for p in produtos_pagina if "produto" in p])
         print(f"[Carga completa] Página {pagina}/{total_paginas} - total de IDs até agora: {len(ids)}")
 
         if pagina >= total_paginas:
@@ -506,6 +519,91 @@ def mesclar_com_csv_existente(produtos_novos: list, marca_categoria: dict) -> pd
     return df_final.reindex(columns=COLUNAS_FINAIS, fill_value="")
 
 
+# ================= COMPLEMENTOS (API v2 + bases do repositório) =================
+def _ler_csv_local(caminho):
+    if not os.path.exists(caminho):
+        return None
+    return pd.read_csv(caminho, sep=";", dtype=str, encoding="utf-8-sig").fillna("")
+
+
+def montar_tags() -> dict:
+    """{id_produto: "Grupo: Tag | Grupo: Tag"} a partir de Tb_ProdutosTag_Tiny e Tb_GrupoTag_Tiny."""
+    tags, grupos = _ler_csv_local(ARQ_PRODUTOS_TAG), _ler_csv_local(ARQ_GRUPO_TAG)
+    if tags is None or tags.empty:
+        return {}
+    grupo_da_tag = {}
+    if grupos is not None and not grupos.empty and {"nome", "grupo"} <= set(grupos.columns):
+        grupo_da_tag = dict(zip(grupos["nome"].str.strip(), grupos["grupo"].str.strip()))
+    col_id = next((c for c in tags.columns if c.lower().replace(" ", "") in ("idproduto", "id")), tags.columns[0])
+    col_tag = next((c for c in tags.columns if c.lower() == "tag"), tags.columns[-1])
+    por_produto = {}
+    for pid, tag in zip(tags[col_id].astype(str).str.strip(), tags[col_tag].astype(str).str.strip()):
+        if not tag:
+            continue
+        rotulo = f"{grupo_da_tag[tag]}: {tag}" if grupo_da_tag.get(tag) else tag
+        lista = por_produto.setdefault(pid, [])
+        if rotulo not in lista:
+            lista.append(rotulo)
+    return {pid: SEP_LISTA.join(sorted(v)) for pid, v in por_produto.items()}
+
+
+def nomes_fornecedores(ids: set) -> dict:
+    """{id_fornecedor: nome}, um contato.obter.php por fornecedor distinto (poucos)."""
+    nomes = {}
+    for fid in sorted(ids):
+        dados = fetch_json_sync(URL_CONTATO, {"token": TOKEN_API, "formato": "json", "id": fid})
+        contato = (dados or {}).get("retorno", {}).get("contato") or {}
+        nome = (contato.get("nome") or contato.get("fantasia") or "").strip()
+        if nome:
+            nomes[fid] = nome
+        time.sleep(INTERVALO_SEGUNDOS_ETAPA1)
+    return nomes
+
+
+def completar_campos(df: pd.DataFrame, pesquisa: list | None = None) -> pd.DataFrame:
+    """Preenche o que o produto.obter.php não traz, com a própria API v2:
+    data_criacao (produtos.pesquisa), data_alteracao dos últimos 29 dias
+    (lista.atualizacoes), nome do fornecedor (contato.obter) e tags (bases locais).
+    Cada etapa é independente: se uma falhar, as outras seguem e a sincronização não para."""
+    df = df.copy()
+    df["id"] = df["id"].fillna("").astype(str).str.replace(r"\.0$", "", regex=True)
+    for col in ("data_criacao", "data_alteracao", "fornecedor_nome", "tags"):
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("")
+    try:
+        lista = pesquisa if pesquisa is not None else listar_pesquisa()
+        criacao = {str(p.get("id")): p.get("data_criacao", "") for p in lista if p.get("data_criacao")}
+        if criacao:
+            df["data_criacao"] = df["id"].map(criacao).fillna(df["data_criacao"])
+        print(f"📅 data_criacao: {len(criacao)} produtos")
+    except Exception as e:
+        print(f"⚠️ data_criacao não atualizada: {e}")
+    try:
+        desde = (agora().replace(tzinfo=None) - timedelta(days=LIMITE_DIAS_ATUALIZACOES - 1)).strftime("%d/%m/%Y 00:00:00")
+        recentes = {str(p.get("id")): p.get("data_alteracao", "") for p in coletar_atualizacoes(desde) if p.get("data_alteracao")}
+        if recentes:
+            df["data_alteracao"] = df["id"].map(recentes).fillna(df["data_alteracao"])
+        print(f"🕒 data_alteracao (últimos {LIMITE_DIAS_ATUALIZACOES} dias): {len(recentes)} produtos")
+    except Exception as e:
+        print(f"⚠️ data_alteracao não atualizada: {e}")
+    try:
+        forn = df["id_fornecedor"].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        ids = {x for x in forn if isinstance(x, str) and x and x not in ("0", "nan")}
+        nomes = nomes_fornecedores(ids) if ids else {}
+        df["fornecedor_nome"] = forn.map(nomes).fillna("")
+        print(f"🏭 fornecedor_nome: {len(nomes)} de {len(ids)} fornecedores")
+    except Exception as e:
+        print(f"⚠️ fornecedor_nome não atualizado: {e}")
+    try:
+        tags = montar_tags()
+        df["tags"] = df["id"].map(tags).fillna("")
+        print(f"🏷️ tags: {sum(1 for v in df['tags'] if v)} produtos com tag")
+    except Exception as e:
+        print(f"⚠️ tags não atualizadas: {e}")
+    return df.reindex(columns=COLUNAS_FINAIS, fill_value="")
+
+
 # ================= FUNÇÃO PRINCIPAL =================
 def main():
     if TOKEN_API in ("", "COLOQUE_SEU_TOKEN_AQUI"):
@@ -526,7 +624,10 @@ def main():
 
         produtos = coletar_atualizacoes(data_alteracao)
         if not produtos:
-            print("Nenhuma atualização de produto encontrada nesse período. Nada a fazer.")
+            print("Nenhuma atualização de produto encontrada nesse período: só os complementos.")
+            df_final = mesclar_com_csv_existente([], {})
+            df_final = completar_campos(df_final)
+            df_final.to_csv(OUTPUT_FILE, index=False, sep=";", encoding="utf-8-sig")
             set_last_run(JOB_NAME)
             return
 
@@ -562,7 +663,8 @@ def main():
         else:
             print("🚀 Nenhum checkpoint encontrado: fazendo carga completa (primeira execução).")
 
-        ids_todos = listar_todos_ids_pesquisa()
+        pesquisa_completa = listar_pesquisa()
+        ids_todos = [str(p["id"]) for p in pesquisa_completa]
         if not ids_todos:
             print("Nenhum produto encontrado. Nada a fazer.")
             return
@@ -576,6 +678,7 @@ def main():
         df_final = mesclar_com_csv_existente(produtos_montados, {})
         total_processados = len(produtos_montados)
 
+    df_final = completar_campos(df_final, locals().get("pesquisa_completa"))
     df_final.to_csv(OUTPUT_FILE, index=False, sep=";", encoding="utf-8-sig")
     set_last_run(JOB_NAME)
 
